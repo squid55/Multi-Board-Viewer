@@ -219,15 +219,16 @@ HTML_PAGE = """<!DOCTYPE html>
     .stat-row:last-child { border-bottom:none; }
     .stat-label { color:#999; }
     .stat-value { font-weight:600; }
-    .bar-bg {
-        width:100px; height:8px; background:#333; border-radius:4px;
-        display:inline-block; vertical-align:middle; margin-left:8px;
+    .bar-row { padding:2px 0 6px 0; }
+    .bar-bg-full {
+        width:100%; height:12px; background:#333; border-radius:6px;
+        overflow:hidden;
     }
     .bar-fill {
-        height:100%; border-radius:4px; transition:width 0.5s;
+        height:100%; border-radius:6px; transition:width 0.5s;
     }
-    .bar-cpu { background:#3b82f6; }
-    .bar-mem { background:#f59e0b; }
+    .bar-cpu { background:linear-gradient(90deg, #3b82f6, #60a5fa); }
+    .bar-mem { background:linear-gradient(90deg, #f59e0b, #fbbf24); }
     .temp-normal { color:#22c55e; }
     .temp-warm { color:#f59e0b; }
     .temp-hot { color:#ef4444; }
@@ -288,16 +289,14 @@ function fetchStatus() {
                     body = `
                         <div class="stat-row">
                             <span class="stat-label">CPU</span>
-                            <span class="stat-value">${s.cpu_pct}%
-                                <span class="bar-bg"><span class="bar-fill bar-cpu" style="width:${s.cpu_pct}%"></span></span>
-                            </span>
+                            <span class="stat-value">${s.cpu_pct}%</span>
                         </div>
+                        <div class="bar-row"><div class="bar-bg-full"><div class="bar-fill bar-cpu" style="width:${s.cpu_pct}%"></div></div></div>
                         <div class="stat-row">
                             <span class="stat-label">Memory</span>
-                            <span class="stat-value">${s.mem_used_gb}/${s.mem_total_gb}GB (${s.mem_pct}%)
-                                <span class="bar-bg"><span class="bar-fill bar-mem" style="width:${s.mem_pct}%"></span></span>
-                            </span>
+                            <span class="stat-value">${s.mem_used_gb}/${s.mem_total_gb}GB (${s.mem_pct}%)</span>
                         </div>
+                        <div class="bar-row"><div class="bar-bg-full"><div class="bar-fill bar-mem" style="width:${s.mem_pct}%"></div></div></div>
                         <div class="stat-row">
                             <span class="stat-label">Temperature</span>
                             <span class="stat-value ${tempClass(s.temp_c)}">${s.temp_c}&deg;C</span>

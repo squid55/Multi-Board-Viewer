@@ -57,6 +57,7 @@ BOARDS = {
 
 ## Network
 
+### LAN (사설망)
 ```
 [공유기 LAN]
     ├── Jetson Orin Nano (192.168.219.108)
@@ -66,6 +67,33 @@ BOARDS = {
 
 [PC] → WiFi로 공유기에 연결 → multi_board_viewer.py 실행
 ```
+
+### Tailscale (외부 접속)
+
+Tailscale VPN을 통해 외부 네트워크(LTE/5G, 카페, 학교 등)에서도 접속 가능.
+
+```
+[Tailscale Network]
+    PC           100.125.10.87    → 통합 뷰어 :9090
+    Jetson Orin  100.77.67.60     → YOLOv8 스트림 :8080
+    RPi 3B       100.123.127.114  → 카메라 스트림 :8080
+```
+
+설치:
+```bash
+# 각 보드 + PC에서
+curl -fsSL https://tailscale.com/install.sh | sudo sh
+sudo tailscale up
+```
+
+## Auto Start
+
+각 보드는 전원 인가 시 자동으로 스트리밍이 시작됨 (systemd service).
+
+| 보드 | 서비스명 | 상태 |
+|------|---------|------|
+| Jetson Orin | `yolo-stream.service` | 등록 완료 |
+| RPi 3B | `camera-stream.service` | 등록 완료 |
 
 ## Related
 

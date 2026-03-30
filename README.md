@@ -92,9 +92,48 @@ sudo tailscale up
 
 | 보드 | 서비스명 | 상태 |
 |------|---------|------|
-| Jetson Orin | `yolo-stream.service` | 등록 완료 |
+| Jetson Orin | `yolo-stream.service` / `fall-detection.service` | 등록 완료 |
 | RPi 3B | `camera-stream.service` | 등록 완료 |
+
+## AI Mode Switching
+
+대시보드에서 Jetson Orin Nano의 AI 모드를 실시간 전환 가능:
+
+| 모드 | 설명 | 포트 |
+|------|------|------|
+| **YOLOv8 Detection** | 80종 객체 탐지 (person, car, bottle...) | 8080 |
+| **Fall Detection** | YOLOv8-Pose 포즈 추정 + 추락/쓰러짐 감지 | 8081 |
+
+Dashboard 버튼 클릭 → 모드 버튼 클릭 → SSH로 Jetson 서비스 자동 전환.
+Tailscale 연결 시 원격에서도 모드 전환 가능.
 
 ## Related
 
 - [Jetson-AI-Camera](https://github.com/squid55/Jetson-AI-Camera) — Jetson Orin Nano YOLOv8 실시간 추론
+- [Construction-Safety-AI](https://github.com/squid55/Construction-Safety-AI) — 건설현장 추락사고 AI 감지
+
+---
+
+## Changelog
+
+### v1.3.0 (2026-03-30)
+- AI 모드 전환 기능 추가 (YOLOv8 Detection ↔ Fall Detection)
+- 대시보드에서 모드 전환 버튼 UI
+- SSH를 통한 원격 서비스 전환 (Tailscale 지원)
+- Fall Detection systemd 서비스 등록
+
+### v1.2.0 (2026-03-29)
+- 멀티스레드 HTTP 서버 (동시 접속 지원)
+- Tailscale VPN 외부 접속 설정
+- systemd 자동 시작 서비스 등록 (Jetson + RPi)
+
+### v1.1.0 (2026-03-29)
+- 실시간 대시보드 추가 (CPU, 메모리, 온도, 업타임)
+- Dashboard 토글 버튼
+- 프로그레스 바 채워지기 수정
+
+### v1.0.0 (2026-03-29)
+- 멀티 보드 카메라 스트리밍 통합 뷰어
+- 2x2 그리드 레이아웃
+- 보드 자동 재연결
+- 브라우저 모드 / OpenCV 모드 지원

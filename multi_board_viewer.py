@@ -17,19 +17,30 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # ──── 보드 설정 ────
 BOARDS = {
-    "Jetson Orin Nano (YOLOv8)": {
+    "Jetson Orin Nano": {
         "stream": "http://192.168.219.108:8080/stream",
         "ssh": "jetson-nx@192.168.219.108",
+        "modes": {
+            "yolo": {"service": "yolo-stream", "port": 8080, "label": "YOLOv8 Detection"},
+            "fall": {"service": "fall-detection", "port": 8081, "label": "Fall Detection"},
+        },
+        "current_mode": "fall",
     },
     "Raspberry Pi 3B": {
         "stream": "http://192.168.219.109:8080/stream",
         "ssh": "rbpi3b@192.168.219.109",
     },
-    # "Jetson Nano": {
-    #     "stream": "http://192.168.219.xxx:8080/stream",
-    #     "ssh": "user@192.168.219.xxx",
-    # },
 }
+
+# 현재 모드에 맞게 스트림 URL 설정
+def get_stream_url(board_name):
+    cfg = BOARDS[board_name]
+    if "modes" in cfg:
+        mode = cfg["current_mode"]
+        port = cfg["modes"][mode]["port"]
+        host = cfg["ssh"].split("@")[1]
+        return f"http://{host}:{port}/stream"
+    return cfg["stream"]
 
 CELL_W, CELL_H = 640, 360
 frames = {}
@@ -102,7 +113,7 @@ def collect_status(name, ssh_target):
 
 
 # ──── 스트림 캡처 ────
-def capture_stream(name, url, color):
+def capture_stream(name, initial_url, color):
     blank = np.zeros((CELL_H, CELL_W, 3), dtype=np.uint8)
     cv2.putText(blank, f"{name}", (10, CELL_H // 2 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
@@ -113,6 +124,8 @@ def capture_stream(name, url, color):
 
     while True:
         try:
+            # 동적으로 현재 URL 가져오기
+            url = get_stream_url(name) if name in BOARDS else initial_url
             cap = cv2.VideoCapture(url)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             fps_time = time.monotonic()
@@ -150,6 +163,48 @@ def capture_stream(name, url, color):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 200), 1)
             frames[name] = dc
         time.sleep(3)
+
+
+# ──── 모드 전환 ────
+capture_threads = {}
+
+def switch_board_mode(board_name, mode):
+    """SSH로 Jetson의 서비스를 전환하고 캡처 스레드를 재시작."""
+    cfg = BOARDS.get(board_name)
+    if not cfg or "modes" not in cfg:
+        return {"ok": False, "error": "Board not found or no modes"}
+    if mode not in cfg["modes"]:
+        return {"ok": False, "error": f"Unknown mode: {mode}"}
+    if mode == cfg["current_mode"]:
+        return {"ok": True, "message": "Already in this mode"}
+
+    ssh_target = cfg["ssh"]
+    old_mode = cfg["current_mode"]
+    old_service = cfg["modes"][old_mode]["service"]
+    new_service = cfg["modes"][mode]["service"]
+
+    try:
+        # 이전 서비스 중지 + 새 서비스 시작
+        cmd = (
+            f"ssh -o ConnectTimeout=5 {ssh_target} "
+            f"\"echo hong1003 | sudo -S bash -c '"
+            f"systemctl stop {old_service}; "
+            f"sleep 2; "
+            f"systemctl start {new_service}"
+            f"'\""
+        )
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+
+        # 현재 모드 업데이트
+        cfg["current_mode"] = mode
+        new_port = cfg["modes"][mode]["port"]
+        host = ssh_target.split("@")[1]
+        cfg["stream"] = f"http://{host}:{new_port}/stream"
+
+        # 캡처 스레드가 자동으로 새 URL에 재연결됨 (disconnect → reconnect)
+        return {"ok": True, "message": f"Switched to {mode}"}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 def build_grid(names):
@@ -311,11 +366,39 @@ function fetchStatus() {
                     body = `<div style="color:#666;padding:20px;text-align:center">Offline</div>
                             <div class="updated">Checked: ${s.updated}</div>`;
                 }
+                // 모드 전환 버튼 (modes가 있는 보드만)
+                if (s.modes) {
+                    body += `<div style="margin-top:10px;display:flex;gap:6px">`;
+                    for (const [modeKey, modeInfo] of Object.entries(s.modes)) {
+                        const active = modeKey === s.current_mode;
+                        const btnStyle = active
+                            ? 'background:#2563eb;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:default;font-size:0.85em'
+                            : 'background:#333;color:#ccc;border:1px solid #555;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.85em';
+                        body += `<button style="${btnStyle}" onclick="${active ? '' : `switchMode('${name}','${modeKey}')`}">${modeInfo.label}${active ? ' ●' : ''}</button>`;
+                    }
+                    body += `</div>`;
+                }
+
                 const card = `<div class="board-card"><h3>${dot}${name}</h3>${body}</div>`;
                 grid.innerHTML += card;
             }
         })
         .catch(() => {});
+}
+
+function switchMode(boardName, mode) {
+    if (!confirm(`Switch ${boardName} to ${mode} mode?`)) return;
+    fetch(`/api/switch?board=${encodeURIComponent(boardName)}&mode=${mode}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.ok) {
+                alert(`Switching to ${mode}... Stream will reconnect in ~30 seconds.`);
+                setTimeout(fetchStatus, 5000);
+            } else {
+                alert('Switch failed: ' + data.error);
+            }
+        })
+        .catch(e => alert('Error: ' + e));
 }
 </script>
 </body>
@@ -352,8 +435,24 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             with status_lock:
-                data = dict(board_status)
+                data = {}
+                for name, s in board_status.items():
+                    data[name] = dict(s)
+                    cfg = BOARDS.get(name, {})
+                    if "modes" in cfg:
+                        data[name]["modes"] = cfg["modes"]
+                        data[name]["current_mode"] = cfg["current_mode"]
             self.wfile.write(json.dumps(data).encode())
+        elif self.path.startswith("/api/switch"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            board_name = params.get("board", [""])[0]
+            mode = params.get("mode", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            result = switch_board_mode(board_name, mode)
+            self.wfile.write(json.dumps(result).encode())
         else:
             self.send_error(404)
 

@@ -16,10 +16,14 @@ import subprocess
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # ──── 보드 설정 ────
+# lan: 같은 네트워크에서 접속 (빠름)
+# tailscale: 외부에서 접속 (어디서든)
 BOARDS = {
     "Jetson Orin Nano": {
-        "stream": "http://192.168.219.108:8080/stream",
-        "ssh": "jetson-nx@192.168.219.108",
+        "stream_lan": "http://100.77.67.60:8080/stream",
+        "stream_tailscale": "http://100.77.67.60:8080/stream",
+        "ssh_lan": "jetson-nx@100.77.67.60",
+        "ssh_tailscale": "jetson-nx@100.77.67.60",
         "modes": {
             "yolo": {"service": "yolo-stream", "port": 8080, "label": "YOLOv8 Detection"},
             "fall": {"service": "fall-detection", "port": 8081, "label": "Fall Detection"},
@@ -27,10 +31,43 @@ BOARDS = {
         "current_mode": "fall",
     },
     "Raspberry Pi 3B": {
-        "stream": "http://192.168.219.109:8080/stream",
-        "ssh": "rbpi3b@192.168.219.109",
+        "stream_lan": "http://192.168.0.13:8080/stream",
+        "stream_tailscale": "http://100.123.127.114:8080/stream",
+        "ssh_lan": "rbpi3b@192.168.0.13",
+        "ssh_tailscale": "rbpi3b@100.123.127.114",
+    },
+    "Jetson Nano": {
+        "stream_lan": "http://192.168.0.11:8080/stream",
+        "stream_tailscale": "http://100.125.186.100:8080/stream",
+        "ssh_lan": "hhj@192.168.0.11",
+        "ssh_tailscale": "hhj@100.125.186.100",
+    },
+    "Zybo Z7-20": {
+        "stream_lan": "http://192.168.0.14:8080/stream",
+        "stream_tailscale": "http://192.168.0.14:8080/stream",
+        "ssh_lan": "root@192.168.0.14",
+        "ssh_tailscale": "root@192.168.0.14",
     },
 }
+
+def is_lan():
+    """LAN에 있는지 자동 감지 (게이트웨이 ping)"""
+    try:
+        result = subprocess.run(
+            ["ping", "-c", "1", "-W", "1", "192.168.0.1"],
+            capture_output=True, timeout=3
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+USE_LAN = is_lan()
+
+# 네트워크에 맞게 stream/ssh 필드 자동 설정
+for name, cfg in BOARDS.items():
+    suffix = "lan" if USE_LAN else "tailscale"
+    cfg["stream"] = cfg.get(f"stream_{suffix}", "")
+    cfg["ssh"] = cfg.get(f"ssh_{suffix}", "")
 
 # 현재 모드에 맞게 스트림 URL 설정
 def get_stream_url(board_name):
@@ -476,7 +513,8 @@ def main():
     args = parser.parse_args()
 
     names = list(BOARDS.keys())
-    print(f"Starting Multi Board Viewer ({len(names)} boards)")
+    mode = "LAN" if USE_LAN else "Tailscale"
+    print(f"Starting Multi Board Viewer ({len(names)} boards, {mode} mode)")
 
     # 캡처 스레드
     for i, (name, cfg) in enumerate(BOARDS.items()):

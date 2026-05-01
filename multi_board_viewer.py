@@ -13,6 +13,7 @@ import time
 import json
 import argparse
 import subprocess
+import urllib.request
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 # ──── 보드 설정 ────
@@ -28,7 +29,14 @@ BOARDS = {
             "yolo": {"service": "yolo-stream", "port": 8080, "label": "YOLOv8 Detection"},
             "fall": {"service": "fall-detection", "port": 8081, "label": "Fall Detection"},
         },
-        "current_mode": "fall",
+        "current_mode": "yolo",
+        "audio": {
+            "tx_port": 5004,        # 보드 mic → PC: PC가 이 포트로 받음
+            "rx_port": 5010,        # PC mic → 보드: 모든 엣지 공통 (옵시디언 노트 계획)
+            "alsa_in": "plughw:0,0",
+            "alsa_out": "plughw:0,0",
+            "label": "USB Headset",
+        },
     },
     "Raspberry Pi 3B": {
         "stream_lan": "http://192.168.0.13:8080/stream",
@@ -62,6 +70,29 @@ def is_lan():
         return False
 
 USE_LAN = is_lan()
+
+
+def get_pc_ip_for_board():
+    """Orin이 PC로 RTP 보낼 때 쓸 IP. LAN이면 LAN IP, 아니면 Tailscale IP."""
+    try:
+        out = subprocess.check_output(["tailscale", "ip", "-4"], timeout=2).decode().strip()
+        ts_ip = out.splitlines()[0] if out else ""
+    except Exception:
+        ts_ip = "100.125.10.87"  # 노트의 PC Tailscale IP
+    if USE_LAN:
+        try:
+            out = subprocess.check_output(
+                ["ip", "-4", "-o", "addr", "show"], timeout=2
+            ).decode()
+            for line in out.splitlines():
+                if "192.168.0." in line:
+                    return line.split()[3].split("/")[0]
+        except Exception:
+            pass
+    return ts_ip
+
+
+PC_IP_FOR_BOARDS = get_pc_ip_for_board()
 
 # 네트워크에 맞게 stream/ssh 필드 자동 설정
 for name, cfg in BOARDS.items():
@@ -149,8 +180,9 @@ def collect_status(name, ssh_target):
         time.sleep(5)
 
 
-# ──── 스트림 캡처 ────
+# ──── 스트림 캡처 (HTTP MJPEG 직접 파싱) ────
 def capture_stream(name, initial_url, color):
+    print(f"[CAP {name}] thread started, initial_url={initial_url}", flush=True)
     blank = np.zeros((CELL_H, CELL_W, 3), dtype=np.uint8)
     cv2.putText(blank, f"{name}", (10, CELL_H // 2 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
@@ -161,38 +193,56 @@ def capture_stream(name, initial_url, color):
 
     while True:
         try:
-            # 동적으로 현재 URL 가져오기
             url = get_stream_url(name) if name in BOARDS else initial_url
-            cap = cv2.VideoCapture(url)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            print(f"[CAP {name}] connecting to {url}", flush=True)
+            req = urllib.request.Request(url)
+            resp = urllib.request.urlopen(req, timeout=5)
+            print(f"[CAP {name}] connected, status={resp.status}", flush=True)
+            buf = b""
             fps_time = time.monotonic()
             fps_count = 0
             current_fps = 0.0
 
             while True:
-                ret, frame = cap.read()
-                if not ret:
+                chunk = resp.read(4096)
+                if not chunk:
                     break
-                frame = cv2.resize(frame, (CELL_W, CELL_H))
-                fps_count += 1
-                elapsed = time.monotonic() - fps_time
-                if elapsed >= 1.0:
-                    current_fps = fps_count / elapsed
-                    fps_count = 0
-                    fps_time = time.monotonic()
+                buf += chunk
+                # JPEG SOI/EOI 마커로 프레임 추출
+                while True:
+                    soi = buf.find(b"\xff\xd8")
+                    eoi = buf.find(b"\xff\xd9", soi + 2) if soi >= 0 else -1
+                    if soi >= 0 and eoi >= 0:
+                        jpg = buf[soi:eoi + 2]
+                        buf = buf[eoi + 2:]
+                        arr = np.frombuffer(jpg, dtype=np.uint8)
+                        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            frame = cv2.resize(frame, (CELL_W, CELL_H))
+                            fps_count += 1
+                            elapsed = time.monotonic() - fps_time
+                            if elapsed >= 1.0:
+                                current_fps = fps_count / elapsed
+                                fps_count = 0
+                                fps_time = time.monotonic()
 
-                cv2.rectangle(frame, (0, 0), (CELL_W, 32), (0, 0, 0), -1)
-                cv2.putText(frame, f"{name}", (8, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                cv2.putText(frame, f"{current_fps:.0f}fps", (CELL_W - 70, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-                cv2.rectangle(frame, (0, 0), (CELL_W - 1, CELL_H - 1), color, 2)
+                            cv2.rectangle(frame, (0, 0), (CELL_W, 32), (0, 0, 0), -1)
+                            cv2.putText(frame, f"{name}", (8, 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+                            cv2.putText(frame, f"{current_fps:.0f}fps", (CELL_W - 70, 22),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+                            cv2.rectangle(frame, (0, 0), (CELL_W - 1, CELL_H - 1), color, 2)
 
-                with lock:
-                    frames[name] = frame
-            cap.release()
-        except Exception:
-            pass
+                            with lock:
+                                frames[name] = frame
+                    else:
+                        break
+            resp.close()
+            print(f"[CAP {name}] resp closed cleanly", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[CAP {name}] EXCEPTION: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
 
         with lock:
             dc = blank.copy()
@@ -244,6 +294,254 @@ def switch_board_mode(board_name, mode):
         return {"ok": False, "error": str(e)}
 
 
+# ──── 오디오 ────
+# 모델:
+#   엣지 (헤드리스): TX(자기말 송출) + RX(PC말 받기) 모두 뷰어 시작 시 SSH로 always-on
+#   PC: 보드별 Listen 토글 (디코드+재생) + 글로벌 Mic 토글 (모든 엣지로 동시 송출)
+audio_lock = threading.Lock()
+edge_audio = {}      # name -> {"tx_ssh": Popen, "rx_ssh": Popen, "started": str}
+pc_listen = {}       # name -> {"proc": Popen, "since": str}
+pc_mic_state = {"proc": None, "since": None}
+audio_supervisor_running = False
+
+
+def _start_edge_tx_rx(board_name):
+    """엣지에 TX/RX 파이프를 SSH로 띄움. always-on."""
+    cfg = BOARDS.get(board_name) or {}
+    a = cfg.get("audio") or {}
+    if not a:
+        return
+    ssh_target = cfg["ssh"]
+    alsa_in = a.get("alsa_in", "plughw:0,0")
+    alsa_out = a.get("alsa_out", "plughw:0,0")
+    tx_port = a["tx_port"]
+    rx_port = a["rx_port"]
+
+    # 엣지 TX: 자기 mic → PC tx_port
+    tx_remote = (
+        f"gst-launch-1.0 -q alsasrc device={alsa_in} ! "
+        f"audioconvert ! audioresample ! "
+        f"opusenc bitrate=32000 inband-fec=true ! "
+        f"rtpopuspay pt=96 ! "
+        f"udpsink host={PC_IP_FOR_BOARDS} port={tx_port}"
+    )
+    # 엣지 RX: PC mic 받기 → 자기 spk
+    rx_remote = (
+        f"gst-launch-1.0 -q udpsrc port={rx_port} "
+        f"caps='application/x-rtp,media=audio,encoding-name=OPUS,payload=96,clock-rate=48000' ! "
+        f"rtpjitterbuffer latency=60 ! rtpopusdepay ! opusdec plc=true ! "
+        f"audioconvert ! audioresample ! "
+        f"alsasink device={alsa_out} sync=false"
+    )
+
+    def ssh_popen(remote):
+        return subprocess.Popen(
+            [
+                "ssh", "-o", "StrictHostKeyChecking=no",
+                "-o", "ConnectTimeout=5",
+                "-o", "ServerAliveInterval=20",
+                "-o", "ServerAliveCountMax=2",
+                ssh_target, remote,
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+
+    tx = ssh_popen(tx_remote)
+    rx = ssh_popen(rx_remote)
+    edge_audio[board_name] = {
+        "tx_ssh": tx, "rx_ssh": rx, "started": time.strftime("%H:%M:%S"),
+    }
+
+
+def _audio_supervisor_loop():
+    """엣지 TX/RX 죽으면 재시작. 보드 재부팅/네트워크 끊김 자동 복구."""
+    while True:
+        try:
+            with audio_lock:
+                for name, cfg in BOARDS.items():
+                    if "audio" not in cfg:
+                        continue
+                    st = edge_audio.get(name)
+                    needs_restart = (
+                        st is None
+                        or st["tx_ssh"].poll() is not None
+                        or st["rx_ssh"].poll() is not None
+                    )
+                    if needs_restart:
+                        # 죽은 거 청소
+                        if st:
+                            for key in ("tx_ssh", "rx_ssh"):
+                                p = st.get(key)
+                                if p and p.poll() is None:
+                                    try:
+                                        p.terminate()
+                                    except Exception:
+                                        pass
+                        _start_edge_tx_rx(name)
+        except Exception as e:
+            print(f"[audio supervisor] {e}", flush=True)
+        time.sleep(8)
+
+
+def start_audio_supervisor():
+    global audio_supervisor_running
+    if audio_supervisor_running:
+        return
+    audio_supervisor_running = True
+    t = threading.Thread(target=_audio_supervisor_loop, daemon=True)
+    t.start()
+
+
+def listen_start(board_name):
+    """PC측 디코드+재생 ON (해당 보드 음성을 PC 스피커로)."""
+    cfg = BOARDS.get(board_name) or {}
+    a = cfg.get("audio")
+    if not a:
+        return {"ok": False, "error": "No audio config"}
+    with audio_lock:
+        st = pc_listen.get(board_name)
+        if st and st["proc"].poll() is None:
+            return {"ok": True, "active": True, "message": "Already listening"}
+        port = a["tx_port"]
+        proc = subprocess.Popen(
+            [
+                "gst-launch-1.0", "-q",
+                "udpsrc", f"port={port}",
+                "caps=application/x-rtp,media=audio,encoding-name=OPUS,payload=96,clock-rate=48000",
+                "!", "rtpjitterbuffer", "latency=60",
+                "!", "rtpopusdepay", "!", "opusdec", "plc=true",
+                "!", "audioconvert", "!", "audioresample",
+                "!", "autoaudiosink", "sync=false",
+            ],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pc_listen[board_name] = {"proc": proc, "since": time.strftime("%H:%M:%S")}
+    return {"ok": True, "active": True}
+
+
+def listen_stop(board_name):
+    with audio_lock:
+        st = pc_listen.pop(board_name, None)
+        if st:
+            p = st["proc"]
+            if p.poll() is None:
+                try:
+                    p.terminate()
+                    p.wait(timeout=2)
+                except Exception:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+    return {"ok": True, "active": False}
+
+
+def listen_status(board_name):
+    st = pc_listen.get(board_name)
+    if not st or st["proc"].poll() is not None:
+        return {"active": False}
+    return {"active": True, "since": st.get("since")}
+
+
+def pc_mic_start():
+    """PC mic → opusenc → tee → 모든 audio 보드의 rx_port로 동시 송출."""
+    with audio_lock:
+        if pc_mic_state["proc"] and pc_mic_state["proc"].poll() is None:
+            return {"ok": True, "active": True, "message": "Already on"}
+        targets = []
+        for name, cfg in BOARDS.items():
+            a = cfg.get("audio")
+            if not a:
+                continue
+            host = cfg["ssh"].split("@")[1]
+            targets.append((host, a["rx_port"], name))
+        if not targets:
+            return {"ok": False, "error": "No audio-capable boards"}
+
+        # 단일 GStreamer 파이프라인: pulsesrc ! ... ! tee name=t  t. ! queue ! rtpopuspay ! udpsink ...
+        pipeline = (
+            "pulsesrc ! audioconvert ! audioresample ! "
+            "opusenc bitrate=32000 inband-fec=true ! tee name=t"
+        )
+        for host, port, _ in targets:
+            pipeline += f" t. ! queue ! rtpopuspay pt=96 ! udpsink host={host} port={port}"
+
+        proc = subprocess.Popen(
+            ["gst-launch-1.0", "-q"] + pipeline.split(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        pc_mic_state["proc"] = proc
+        pc_mic_state["since"] = time.strftime("%H:%M:%S")
+        pc_mic_state["targets"] = [n for _, _, n in targets]
+    return {"ok": True, "active": True, "targets": pc_mic_state["targets"]}
+
+
+def pc_mic_stop():
+    with audio_lock:
+        p = pc_mic_state.get("proc")
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+                p.wait(timeout=2)
+            except Exception:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+        pc_mic_state["proc"] = None
+        pc_mic_state["since"] = None
+    return {"ok": True, "active": False}
+
+
+def pc_mic_status():
+    p = pc_mic_state.get("proc")
+    if not p or p.poll() is not None:
+        return {"active": False}
+    return {
+        "active": True,
+        "since": pc_mic_state.get("since"),
+        "targets": pc_mic_state.get("targets", []),
+    }
+
+
+def edge_audio_status(board_name):
+    """엣지 TX/RX 상태 (디버깅용)."""
+    st = edge_audio.get(board_name)
+    if not st:
+        return {"tx_alive": False, "rx_alive": False}
+    return {
+        "tx_alive": st["tx_ssh"].poll() is None,
+        "rx_alive": st["rx_ssh"].poll() is None,
+        "started": st.get("started"),
+    }
+
+
+def shutdown_all_audio():
+    """뷰어 종료 시 호출."""
+    with audio_lock:
+        for name, st in list(edge_audio.items()):
+            for key in ("tx_ssh", "rx_ssh"):
+                p = st.get(key)
+                if p and p.poll() is None:
+                    try:
+                        p.terminate()
+                    except Exception:
+                        pass
+        for name, st in list(pc_listen.items()):
+            p = st.get("proc")
+            if p and p.poll() is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+        p = pc_mic_state.get("proc")
+        if p and p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+
+
 def build_grid(names):
     n = len(names)
     cols = 2 if n >= 2 else 1
@@ -283,6 +581,16 @@ HTML_PAGE = """<!DOCTYPE html>
     }
     #dashBtn:hover { background:#1d4ed8; }
     #dashBtn.active { background:#dc2626; }
+    #micBtn {
+        background:#16a34a; color:white; border:none; padding:8px 16px;
+        border-radius:6px; cursor:pointer; font-size:0.9em; margin-right:8px;
+    }
+    #micBtn.active { background:#dc2626; animation:pulse 1.5s infinite; }
+    @keyframes pulse {
+        0%,100% { box-shadow:0 0 0 0 rgba(220,38,38,0.6); }
+        50%     { box-shadow:0 0 0 8px rgba(220,38,38,0); }
+    }
+    .header-actions { display:flex; align-items:center; }
     .stream-container { text-align:center; padding:4px; }
     .stream-container img { max-width:100%; }
     #dashboard {
@@ -330,7 +638,10 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 <div class="header">
     <h2>Multi Board Viewer (BOARD_COUNT boards)</h2>
-    <button id="dashBtn" onclick="toggleDash()">Dashboard</button>
+    <div class="header-actions">
+        <button id="micBtn" onclick="togglePcMic()">🎤 Mic OFF</button>
+        <button id="dashBtn" onclick="toggleDash()">Dashboard</button>
+    </div>
 </div>
 <div class="stream-container">
     <img src="/stream">
@@ -371,6 +682,18 @@ function fetchStatus() {
     fetch('/api/status')
         .then(r => r.json())
         .then(data => {
+            // 글로벌 PC Mic 상태 반영
+            const micBtn = document.getElementById('micBtn');
+            const micState = data._pc_mic || {};
+            if (micState.active) {
+                micBtn.textContent = '🎤 Mic ON → ' + (micState.targets || []).length + ' boards';
+                micBtn.classList.add('active');
+            } else {
+                micBtn.textContent = '🎤 Mic OFF';
+                micBtn.classList.remove('active');
+            }
+            delete data._pc_mic;
+
             const grid = document.getElementById('dashGrid');
             grid.innerHTML = '';
             for (const [name, s] of Object.entries(data)) {
@@ -403,6 +726,27 @@ function fetchStatus() {
                     body = `<div style="color:#666;padding:20px;text-align:center">Offline</div>
                             <div class="updated">Checked: ${s.updated}</div>`;
                 }
+                // 오디오 (audio가 있는 보드만)
+                if (s.audio) {
+                    const a = s.audio;
+                    const listening = !!(a.listen && a.listen.active);
+                    const txAlive = !!(a.edge && a.edge.tx_alive);
+                    const rxAlive = !!(a.edge && a.edge.rx_alive);
+                    const edgeDot = (txAlive && rxAlive) ? '🟢' : '🔴';
+                    const btnLabel = listening ? '🔇 Mute' : '🎧 Listen';
+                    const btnAction = listening ? 'stop' : 'start';
+                    const btnStyle = listening
+                        ? 'background:#dc2626;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.85em'
+                        : 'background:#16a34a;color:white;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;font-size:0.85em';
+                    const sinceText = listening && a.listen.since ? ` <span style="color:#888;font-size:0.8em">since ${a.listen.since}</span>` : '';
+                    body += `
+                        <div class="stat-row" style="margin-top:8px">
+                            <span class="stat-label">${edgeDot} ${a.label}${sinceText}</span>
+                            <button style="${btnStyle}" onclick="toggleListen('${name}','${btnAction}')">${btnLabel}</button>
+                        </div>
+                    `;
+                }
+
                 // 모드 전환 버튼 (modes가 있는 보드만)
                 if (s.modes) {
                     body += `<div style="margin-top:10px;display:flex;gap:6px">`;
@@ -422,6 +766,35 @@ function fetchStatus() {
         })
         .catch(() => {});
 }
+
+function toggleListen(boardName, action) {
+    fetch(`/api/listen?board=${encodeURIComponent(boardName)}&action=${action}`)
+        .then(r => r.json())
+        .then(data => {
+            if (!data.ok) alert('Listen ' + action + ' failed: ' + (data.error || ''));
+            setTimeout(fetchStatus, 400);
+        })
+        .catch(e => alert('Error: ' + e));
+}
+
+function togglePcMic() {
+    const btn = document.getElementById('micBtn');
+    const action = btn.classList.contains('active') ? 'stop' : 'start';
+    fetch(`/api/mic?action=${action}`)
+        .then(r => r.json())
+        .then(data => {
+            if (!data.ok) alert('Mic ' + action + ' failed: ' + (data.error || ''));
+            // 대시보드 닫혀있어도 즉시 갱신 위해 한 번 호출
+            setTimeout(fetchStatus, 400);
+        })
+        .catch(e => alert('Error: ' + e));
+}
+
+function refreshMicState() {
+    // 대시보드 닫혀 있어도 헤더 버튼 상태는 항상 갱신
+    if (!dashOpen) fetchStatus();
+}
+setInterval(refreshMicState, 5000);
 
 function switchMode(boardName, mode) {
     if (!confirm(`Switch ${boardName} to ${mode} mode?`)) return;
@@ -479,6 +852,13 @@ class ViewerHandler(BaseHTTPRequestHandler):
                     if "modes" in cfg:
                         data[name]["modes"] = cfg["modes"]
                         data[name]["current_mode"] = cfg["current_mode"]
+                    if "audio" in cfg:
+                        data[name]["audio"] = {
+                            "label": cfg["audio"].get("label", "Audio"),
+                            "edge": edge_audio_status(name),
+                            "listen": listen_status(name),
+                        }
+                data["_pc_mic"] = pc_mic_status()
             self.wfile.write(json.dumps(data).encode())
         elif self.path.startswith("/api/switch"):
             from urllib.parse import urlparse, parse_qs
@@ -489,6 +869,35 @@ class ViewerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-type", "application/json")
             self.end_headers()
             result = switch_board_mode(board_name, mode)
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path.startswith("/api/listen"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            board_name = params.get("board", [""])[0]
+            action = params.get("action", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            if action == "start":
+                result = listen_start(board_name)
+            elif action == "stop":
+                result = listen_stop(board_name)
+            else:
+                result = {"ok": False, "error": "action must be start|stop"}
+            self.wfile.write(json.dumps(result).encode())
+        elif self.path.startswith("/api/mic"):
+            from urllib.parse import urlparse, parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            action = params.get("action", [""])[0]
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.end_headers()
+            if action == "start":
+                result = pc_mic_start()
+            elif action == "stop":
+                result = pc_mic_stop()
+            else:
+                result = {"ok": False, "error": "action must be start|stop"}
             self.wfile.write(json.dumps(result).encode())
         else:
             self.send_error(404)
@@ -527,6 +936,15 @@ def main():
     for name, cfg in BOARDS.items():
         t = threading.Thread(target=collect_status, args=(name, cfg["ssh"]), daemon=True)
         t.start()
+
+    # 오디오: audio 있는 보드의 TX/RX 항상 ON (supervisor가 죽으면 재시작)
+    audio_boards = [n for n, c in BOARDS.items() if "audio" in c]
+    if audio_boards:
+        print(f"  audio always-on: {audio_boards}")
+        start_audio_supervisor()
+
+    import atexit
+    atexit.register(shutdown_all_audio)
 
     if args.web:
         t = threading.Thread(target=grid_update_loop, args=(names,), daemon=True)
